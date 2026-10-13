@@ -12,9 +12,12 @@
   #overlay { position: absolute; left: 0; top: 0; pointer-events: none; }
   #bigCount { position: absolute; right: 12px; top: 6px; font-size: 80px; font-weight: bold; color: #fff;
               text-shadow: 0 0 8px #000, 0 0 3px #000; line-height: 1; }
+  #phase { position: absolute; left: 12px; top: 10px; font-size: 26px; font-weight: bold; color: #fff;
+           background: rgba(0,0,0,.55); padding: 2px 10px; border-radius: 6px; }
   #info { margin: 8px 0; font-size: 15px; line-height: 1.8; }
   #msg { font-size: 18px; font-weight: bold; }
   #stats { color: #aaa; font-size: 13px; direction: ltr; text-align: right; }
+  #chart { width: 100%; height: 90px; background: #0b0b0b; display: block; direction: ltr; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
   button { font-family: inherit; font-size: 16px; padding: 8px 16px; }
   select { font-family: inherit; font-size: 14px; padding: 4px; }
@@ -26,6 +29,7 @@
   <div id="stage">
     <video id="video" playsinline muted autoplay></video>
     <canvas id="overlay"></canvas>
+    <div id="phase">-</div>
     <div id="bigCount">0</div>
   </div>
 
@@ -33,6 +37,8 @@
     <div id="msg">برای شروع، دکمه «شروع» را بزن</div>
     <div id="stats"></div>
   </div>
+
+  <canvas id="chart" width="900" height="90"></canvas>
 
   <div class="row">
     <button id="btnStart">شروع</button>
@@ -52,9 +58,9 @@
     </label>
     <label>عمق لازم:
       <select id="depth">
-        <option value="95">کامل (آرنج تا ۹۵°)</option>
-        <option value="110" selected>استاندارد (تا ۱۱۰°)</option>
-        <option value="125">سبک (تا ۱۲۵°)</option>
+        <option value="0.2">کامل (۸۰٪ عمق معمول)</option>
+        <option value="0.35" selected>استاندارد (۶۵٪)</option>
+        <option value="0.5">سبک (۵۰٪)</option>
       </select>
     </label>
     <label><input type="checkbox" id="chkBeep" checked> بوق</label>
@@ -62,9 +68,12 @@
   </div>
 
   <div id="tips">
-    راهنمای قرار دادن دوربین: از <b>کنار</b> بدن (نمای پروفایل)، با فاصله حدود ۱.۵ تا ۲.۵ متر، ارتفاع حدود کمر/شانه، ثابت (سه‌پایه یا تکیه به دیوار)،
-    و <b>کل بدن از سر تا مچ پا</b> داخل کادر. نور کافی باشد و لباس هم‌رنگ زمینه نباشد.
-    برای دوربین باید صفحه با https یا localhost باز شود.
+    <b>روش کار:</b> سیستم ارتفاع بالاتنه (شانه‌ها و سر) را نسبت به کف زمین دنبال می‌کند. دو حالت دارد:
+    <b>بالا</b> و <b>پایین</b>. هر بار که از بالا به پایین بروی و کامل برگردی بالا، یک شنا شمرده می‌شود.
+    دو شنای اول، دامنهٔ حرکت خودت را یاد می‌گیرد (پس این دو تا را درست و کامل بزن)؛ بعد از آن، فقط شنای هم‌اندازه با الگوی خودت شمرده می‌شود.
+    نمودار پایین ارتفاع بدن را زنده نشان می‌دهد (خط سبز = مرز بالا، خط قرمز = مرز پایین).<br>
+    <b>جای دوربین:</b> کاملاً از <b>کنار</b> بدن، ۱.۵ تا ۲.۵ متر دورتر، ارتفاع حدود کمر، ثابت، و
+    <b>کل بدن از سر تا مچ پا</b> داخل کادر. برای دوربین باید صفحه با https یا localhost باز شود.
   </div>
 </div>
 
@@ -74,14 +83,15 @@ import { PoseLandmarker, FilesetResolver, DrawingUtils }
 
 const $ = id => document.getElementById(id);
 const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+const chart = $("chart"), cc = chart.getContext("2d");
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
-const median3 = arr => [...arr].sort((a, b) => a - b)[Math.floor(arr.length / 2)];
+const sortedMid = arr => [...arr].sort((a, b) => a - b)[Math.floor(arr.length / 2)];
 
 /* ------------------------------------------------------------------ */
-/*  فیلتر One-Euro برای صاف کردن زاویه (بدون تاخیر زیاد، بدون لرزش)     */
+/*  فیلتر One-Euro                                                     */
 /* ------------------------------------------------------------------ */
 class OneEuro {
-  constructor(minCutoff = 1.5, beta = 0.04, dCutoff = 1.0) {
+  constructor(minCutoff = 1.5, beta = 12, dCutoff = 1.0) {
     this.minCutoff = minCutoff; this.beta = beta; this.dCutoff = dCutoff; this.reset();
   }
   reset() { this.t = null; this.x = 0; this.dx = 0; }
@@ -99,168 +109,187 @@ class OneEuro {
 }
 
 /* ------------------------------------------------------------------ */
-/*  هندسه                                                              */
+/*  استخراج اطلاعات هر فریم                                            */
+/*  chestY : ارتفاع (پیکسل) بالاتنه = میانگین وزنی شانه‌ها و بینی       */
+/*  scaleRaw : طول بدن در تصویر (شانه تا مچ پا) برای نرمال‌سازی          */
+/*  ankleY : y مچ پاها (نقطهٔ ثابت روی زمین)                           */
+/*  plank : آیا بدن تقریباً افقی است؟                                   */
 /* ------------------------------------------------------------------ */
-function angle3(a, b, c) {
-  const v1 = [a.x - b.x, a.y - b.y, a.z - b.z], v2 = [c.x - b.x, c.y - b.y, c.z - b.z];
-  const n = Math.hypot(...v1) * Math.hypot(...v2);
-  if (n < 1e-9) return null;
-  const d = v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2];
-  return Math.acos(clamp(d / n, -1, 1)) * 180 / Math.PI;
-}
-function angle2(a, b, c, W, H) {
-  const v1 = [(a.x - b.x) * W, (a.y - b.y) * H], v2 = [(c.x - b.x) * W, (c.y - b.y) * H];
-  const n = Math.hypot(...v1) * Math.hypot(...v2);
-  if (n < 1e-9) return null;
-  return Math.acos(clamp((v1[0] * v2[0] + v1[1] * v2[1]) / n, -1, 1)) * 180 / Math.PI;
-}
-
-/* استخراج اطلاعات هر فریم: زاویه آرنج، ارتفاع شانه از مچ، حالت شنا (بدن افقی) */
 function analyze(lm, wl, W, H) {
   if (!lm) return null;
   const vis = p => (p && p.visibility !== undefined ? p.visibility : 1);
-  const sides = [[11, 13, 15], [12, 14, 16]]; // شانه، آرنج، مچ (چپ/راست)
 
-  let sumW = 0, sumA = 0, sumH = 0;
-  for (const [s, e, w] of sides) {
-    const v = Math.min(vis(lm[s]), vis(lm[e]), vis(lm[w]));
-    if (v < 0.3) continue;
-    const a = wl ? angle3(wl[s], wl[e], wl[w]) : angle2(lm[s], lm[e], lm[w], W, H);
-    if (a === null) continue;
-    const wgt = v * v;                       // وزن بر اساس دیده شدن (دست دورتر کم‌وزن می‌شود)
-    sumW += wgt; sumA += a * wgt;
-    if (wl) sumH += (wl[w].y - wl[s].y) * wgt; // y رو به پایین: مچ - شانه = ارتفاع شانه از دست
+  let sw = 0, sy = 0;
+  for (const [i, w] of [[0, 1], [11, 2], [12, 2]]) {
+    const v = vis(lm[i]); if (v < 0.3) continue;
+    sw += v * w; sy += lm[i].y * H * v * w;
   }
-  if (sumW === 0) return null;
+  if (sw === 0) return null;
+  const chestY = sy / sw;
 
-  // آیا بدن تقریباً افقی است؟ (حالت پلانک/شنا، نه ایستاده)
-  const sv = (vis(lm[11]) + vis(lm[12])) / 2, hv = (vis(lm[23]) + vis(lm[24])) / 2;
+  const mid = (ids, th) => {
+    let n = 0, x = 0, y = 0;
+    for (const i of ids) if (vis(lm[i]) >= th) { n++; x += lm[i].x * W; y += lm[i].y * H; }
+    return n ? { x: x / n, y: y / n } : null;
+  };
+  const sh = mid([11, 12], 0.3);
+  if (!sh) return null;
+  const hip = mid([23, 24], 0.3), knee = mid([25, 26], 0.3), ank = mid([27, 28], 0.3);
+
+  let scaleRaw = null;
+  if (ank) scaleRaw = Math.hypot(sh.x - ank.x, sh.y - ank.y);
+  else if (knee) scaleRaw = Math.hypot(sh.x - knee.x, sh.y - knee.y) * 1.47;
+  else if (hip) scaleRaw = Math.hypot(sh.x - hip.x, sh.y - hip.y) * 2.8;
+  if (!scaleRaw || scaleRaw < 20) return null;
+
+  // بدن افقی است؟ (۲بعدی در تصویر، یا ۳بعدی با مختصات جهانی؛ هرکدام تأیید کرد کافی است)
   let plank = false;
-  if (sv > 0.3 && hv > 0.3) {
-    let vx, vy, vz = 0;
-    if (wl) {
-      vx = (wl[11].x + wl[12].x) / 2 - (wl[23].x + wl[24].x) / 2;
-      vy = (wl[11].y + wl[12].y) / 2 - (wl[23].y + wl[24].y) / 2;
-      vz = (wl[11].z + wl[12].z) / 2 - (wl[23].z + wl[24].z) / 2;
-    } else {
-      vx = ((lm[11].x + lm[12].x) / 2 - (lm[23].x + lm[24].x) / 2) * W;
-      vy = ((lm[11].y + lm[12].y) / 2 - (lm[23].y + lm[24].y) / 2) * H;
-    }
+  const end = hip || ank || knee;
+  if (end) {
+    const dx = sh.x - end.x, dy = sh.y - end.y, len = Math.hypot(dx, dy);
+    plank = len > 1 && Math.abs(dy) / len < 0.75;
+  }
+  if (!plank && wl && hip) {
+    const vx = (wl[11].x + wl[12].x) / 2 - (wl[23].x + wl[24].x) / 2;
+    const vy = (wl[11].y + wl[12].y) / 2 - (wl[23].y + wl[24].y) / 2;
+    const vz = (wl[11].z + wl[12].z) / 2 - (wl[23].z + wl[24].z) / 2;
     const len = Math.hypot(vx, vy, vz);
-    plank = len > 1e-6 && (Math.abs(vy) / len) < 0.62; // کمتر از ~۳۸ درجه نسبت به افق
+    plank = len > 1e-6 && Math.abs(vy) / len < 0.62;
   }
 
-  return { angle: sumA / sumW, h: wl ? sumH / sumW : null, plank };
+  return { chestY, scaleRaw, ankleY: ank ? ank.y : null, plank };
 }
 
 /* ------------------------------------------------------------------ */
-/*  ماشین حالت شمارش شنا                                              */
+/*  شمارندهٔ شنا بر اساس دو حالت «بالا» و «پایین»                      */
+/*                                                                    */
+/*  سیگنال v = (y مچ پا − y بالاتنه) / طول بدن   → بالا = عدد بزرگ     */
+/*                                                                    */
+/*  مرحلهٔ ۱ (یادگیری، دو شنای اول): چرخهٔ بالا→پایین→بالا با           */
+/*     دامنهٔ حداقل ۰.۰۷ طول بدن.                                      */
+/*  مرحلهٔ ۲ (کالیبره): از میانهٔ ۵ شنای آخر، سطح بالا (T) و پایین (B)   */
+/*     مشخص می‌شود. «پایین» یعنی v ≤ B + d·A ، «بالا» یعنی v ≥ B+0.65A */
+/*     هر شنا = رسیدن به ناحیهٔ پایین و بعد برگشتن به ناحیهٔ بالا.        */
 /* ------------------------------------------------------------------ */
 class PushupCounter {
-  constructor(onRep) { this.onRep = onRep; this.downT = 110; this.hardReset(); }
+  constructor(onRep) {
+    this.onRep = onRep; this.dFrac = 0.35;
+    this.hardReset();
+  }
+  hardReset() { this.count = 0; this.reps = []; this.lastRep = null; this.filter = new OneEuro(); this.toSettle("آماده"); }
+  setDepth(d) { this.dFrac = d; }
 
-  hardReset() { this.count = 0; this.lastRep = null; this.recentTops = []; this.toWait("آماده"); this.filter = new OneEuro(); this.angle = null; }
-
-  setDepth(d) { this.downT = d; this.recomputeUp(); }
-
-  recomputeUp() {
-    const floor = Math.min(Math.max(135, this.downT + 25), 148);
-    if (this.recentTops.length === 0) { this.upT = clamp(145, floor, 148); return; }
-    const avg = this.recentTops.reduce((a, b) => a + b, 0) / this.recentTops.length;
-    this.upT = clamp(0.93 * avg, floor, 148);
+  calib() {
+    if (this.reps.length < 2) return null;
+    const T = sortedMid(this.reps.map(r => r.top)), B = sortedMid(this.reps.map(r => r.bot));
+    const A = T - B;
+    return A >= 0.07 ? { T, B, A } : null;
   }
 
-  toWait(msg) {
-    this.state = "WAIT"; this.armSince = null; this.exc = false;
-    this.buf = []; if (this.filter) this.filter.reset();
-    this.hs = null; this.hTop = null; this.hBottom = null;
-    this.topMax = 0; this.excMin = 999; this.excStart = 0; this.downSince = 0;
+  toSettle(msg) {
+    this.state = "SETTLE"; this.settleStart = null;
+    this.buf = []; this.hist = []; this.filter.reset();
+    this.scale = null; this.floor = null; this.v = null;
+    this.topRef = 0; this.botRef = 0; this.repTop = 0; this.leaveTopT = 0; this.enterBottomT = 0;
+    this.exc = false; this.excMin = 999;
     this.plankLostSince = null; this.lastValidT = null;
-    this.recomputeUp();
     if (msg) this.msg = msg;
   }
 
   update(info, t) {
-    // ---- بدن پیدا نشد
+    // ---- بدن دیده نمی‌شود
     if (!info) {
-      if (this.lastValidT !== null && t - this.lastValidT > 1.5) this.toWait("بدن در کادر دیده نمی‌شود");
-      else if (this.lastValidT === null) this.msg = "بدن در کادر دیده نمی‌شود";
+      if (this.lastValidT === null) { if (this.state !== "SETTLE") this.toSettle(); this.msg = "بدن در کادر دیده نمی‌شود"; }
+      else if (t - this.lastValidT > 1.5) this.toSettle("بدن در کادر دیده نمی‌شود");
       return;
     }
     this.lastValidT = t;
 
-    // ---- بدن افقی نیست
+    // ---- بدن افقی نیست (ایستاده/نشسته)
     if (!info.plank) {
       if (this.plankLostSince === null) this.plankLostSince = t;
-      if (t - this.plankLostSince > 0.6) {
-        const keep = this.lastValidT; this.toWait("حالت شنا تشخیص داده نشد (دوربین از کنار، کل بدن در کادر)"); this.lastValidT = keep;
-      }
+      if (t - this.plankLostSince > 1.0) { this.toSettle("حالت شنا تشخیص داده نشد (دوربین از کنار، کل بدن در کادر)"); this.lastValidT = t; }
       return;
     }
     this.plankLostSince = null;
 
-    // ---- فیلتر زاویه (میانه ۳تایی برای حذف پرش + One-Euro)
-    this.buf.push(info.angle); if (this.buf.length > 3) this.buf.shift();
-    const a = this.filter.filter(median3(this.buf), t);
-    this.angle = a;
-    if (info.h !== null) this.hs = this.hs === null ? info.h : this.hs + 0.4 * (info.h - this.hs);
-    const hs = this.hs;
+    // ---- ساخت سیگنال ارتفاع
+    this.scale = this.scale === null ? info.scaleRaw : this.scale + 0.03 * (info.scaleRaw - this.scale);
+    if (info.ankleY !== null) this.floor = this.floor === null ? info.ankleY : this.floor + 0.05 * (info.ankleY - this.floor);
+    const raw = ((this.floor === null ? 0 : this.floor) - info.chestY) / this.scale;
+    this.buf.push(raw); if (this.buf.length > 3) this.buf.shift();
+    const v = this.filter.filter(sortedMid(this.buf), t);
+    this.v = v;
+    this.hist.push({ t, v });
+    while (this.hist.length && t - this.hist[0].t > 10) this.hist.shift();
 
-    switch (this.state) {
-      case "WAIT": {
-        if (a >= 135) {
-          if (this.armSince === null) this.armSince = t;
-          if (t - this.armSince >= 0.3) {
-            this.state = "UP"; this.topMax = a; this.exc = false;
-            this.hTop = hs; this.hBottom = null; this.msg = "بالا ✓ — شروع کن";
-          } else this.msg = "در حال آماده‌سازی...";
-        } else { this.armSince = null; this.msg = "دست‌ها را صاف کن (حالت بالا)"; }
-        break;
-      }
+    // ---- حالت‌ها
+    if (this.state === "SETTLE") {
+      if (this.settleStart === null) this.settleStart = t;
+      const win = this.hist.filter(p => t - p.t <= 0.6);
+      const mn = Math.min(...win.map(p => p.v)), mx = Math.max(...win.map(p => p.v));
+      if (t - this.settleStart >= 0.6 && win.length >= 4 && (mx - mn) <= 0.04) {
+        this.state = "TOP"; this.topRef = v; this.exc = false; this.excMin = 999;
+        this.msg = "آماده — شروع کن";
+      } else this.msg = "در حالت شنا ثابت بمان...";
+      return;
+    }
 
-      case "UP": {
-        if (!this.exc) {
-          if (a < this.upT - 10) {                       // شروع پایین رفتن
-            this.exc = true; this.excStart = t; this.excMin = a;
-            this.hBottom = hs;
-            if (this.topMax > 0) { this.recentTops.push(this.topMax); if (this.recentTops.length > 4) this.recentTops.shift(); this.recomputeUp(); }
-          } else {
-            this.topMax = Math.max(this.topMax, a);
-            if (hs !== null) this.hTop = this.hTop === null ? hs : Math.max(this.hTop, hs);
-            this.msg = "بالا";
+    const cal = this.calib();
+
+    if (this.state === "TOP") {
+      this.topRef = Math.max(this.topRef, v);
+      if (!cal) {
+        if (this.topRef - v >= 0.05) {
+          this.state = "BOTTOM"; this.botRef = v; this.repTop = this.topRef;
+          this.leaveTopT = t; this.enterBottomT = t; this.msg = "پایین";
+        } else this.msg = "بالا";
+      } else {
+        const upZ = cal.B + 0.65 * cal.A, downZ = cal.B + this.dFrac * cal.A;
+        if (this.exc) this.excMin = Math.min(this.excMin, v);
+        if (v <= downZ) {
+          this.state = "BOTTOM"; this.botRef = v; this.repTop = this.topRef;
+          this.leaveTopT = t; this.enterBottomT = t; this.exc = false; this.excMin = 999;
+          this.msg = "پایین — حالا بالا بیا";
+        } else if (v < upZ - 0.15 * cal.A) {
+          if (!this.exc) { this.exc = true; this.excMin = v; this.leaveTopT = t; }
+          this.msg = "در حال پایین رفتن...";
+        } else if (v >= upZ && this.exc) {
+          this.exc = false;
+          if (this.excMin > downZ) {
+            const pct = Math.round(100 * (cal.T - this.excMin) / cal.A);
+            this.msg = `ناقص ✗ — فقط ${pct}٪ عمق معمولت پایین رفتی`;
           }
-        }
-        if (this.exc) {
-          this.excMin = Math.min(this.excMin, a);
-          if (hs !== null) this.hBottom = this.hBottom === null ? hs : Math.min(this.hBottom, hs);
-          if (a <= this.downT) {                         // به عمق رسید
-            this.state = "DOWN"; this.downSince = t; this.msg = "پایین — حالا بالا بیا";
-          } else if (a >= this.upT) {                    // برگشت بدون رسیدن به عمق
-            this.msg = `ناقص ✗ — فقط تا ${Math.round(this.excMin)}° پایین رفتی (باید زیر ${this.downT}°)`;
-            this.exc = false; this.topMax = a; this.hTop = hs; this.hBottom = null;
-          } else this.msg = "در حال پایین رفتن...";
-        }
-        break;
+          this.excMin = 999;
+        } else if (!this.exc) this.msg = "بالا";
       }
+      return;
+    }
 
-      case "DOWN": {
-        this.excMin = Math.min(this.excMin, a);
-        if (hs !== null) this.hBottom = this.hBottom === null ? hs : Math.min(this.hBottom, hs);
-        if (a >= this.upT) {                             // قفل بالا → تکمیل حرکت
-          const dur = t - this.excStart;
-          const travelOK = (this.hTop === null || this.hBottom === null) || (this.hTop - this.hBottom) >= 0.08;
-          if (dur < 0.45) this.msg = "حرکت خیلی سریع/نویز — شمرده نشد";
-          else if (!travelOK) this.msg = "جابه‌جایی بدن تأیید نشد — شمرده نشد";
-          else {
-            this.count++; this.lastRep = { depth: this.excMin, dur };
-            this.msg = `✓ شنا ${this.count}`;
-            this.onRep(this.count);
-          }
-          this.state = "UP"; this.exc = false; this.topMax = a; this.hTop = hs; this.hBottom = null;
-        } else if (t - this.downSince > 20) {
-          this.toWait("مدت زیادی پایین ماندی — دوباره از بالا شروع کن");
-        } else this.msg = "پایین — حالا بالا بیا";
-        break;
+    if (this.state === "BOTTOM") {
+      this.botRef = Math.min(this.botRef, v);
+      let done = false;
+      if (!cal) {
+        const amp = this.repTop - this.botRef;
+        if (amp > 0.45) { this.state = "TOP"; this.topRef = v; this.msg = "حرکت نامعتبر — دوباره از بالا شروع کن"; }
+        else if (amp >= 0.07 && v - this.botRef >= 0.6 * amp) done = true;
+        else if (amp < 0.07 && v - this.botRef >= 0.05) { this.state = "TOP"; this.topRef = Math.max(this.repTop, v); }
+        else this.msg = "پایین";
+      } else {
+        const upZ = cal.B + 0.65 * cal.A;
+        if (v >= upZ) done = true;
+        else if (t - this.enterBottomT > 20) this.toSettle("مدت زیادی پایین ماندی — دوباره از بالا شروع کن");
+        else this.msg = "پایین — حالا بالا بیا";
+      }
+      if (done) {
+        const dur = t - this.leaveTopT;
+        if (dur < 0.3) { this.state = "TOP"; this.topRef = v; this.msg = "حرکت خیلی سریع/نویز — شمرده نشد"; return; }
+        this.reps.push({ top: this.repTop, bot: this.botRef }); if (this.reps.length > 5) this.reps.shift();
+        this.count++;
+        this.lastRep = { amp: this.repTop - this.botRef, dur };
+        this.state = "TOP"; this.topRef = v; this.exc = false; this.excMin = 999;
+        this.msg = `✓ شنا ${this.count}`;
+        this.onRep(this.count);
       }
     }
   }
@@ -309,8 +338,7 @@ async function loadLandmarker(model) {
     let lm;
     try { lm = await make("GPU"); } catch (e) { lm = await make("CPU"); }
     if (landmarker) { try { landmarker.close(); } catch (e) {} }
-    landmarker = lm; loadedModel = model;
-    lastVideoTime = -1;
+    landmarker = lm; loadedModel = model; lastVideoTime = -1;
   } finally { loading = false; }
 }
 
@@ -364,9 +392,36 @@ function loop() {
 function render() {
   $("bigCount").textContent = counter.count;
   $("msg").textContent = counter.msg || "";
-  const a = counter.angle === null ? "-" : counter.angle.toFixed(0) + "°";
-  const last = counter.lastRep ? ` | last: depth ${counter.lastRep.depth.toFixed(0)}°, ${counter.lastRep.dur.toFixed(1)}s` : "";
-  $("stats").textContent = `elbow ${a} | state ${counter.state} | down<${counter.downT}° up>${counter.upT.toFixed(0)}° | ${fps.toFixed(0)} fps${last}`;
+  $("phase").textContent = counter.state === "TOP" ? "بالا ▲" : counter.state === "BOTTOM" ? "پایین ▼" : "...";
+  const cal = counter.calib();
+  const v = counter.v === null ? "-" : counter.v.toFixed(3);
+  const last = counter.lastRep ? ` | last amp ${counter.lastRep.amp.toFixed(3)}, ${counter.lastRep.dur.toFixed(1)}s` : "";
+  const zones = cal ? ` | T ${cal.T.toFixed(3)} B ${cal.B.toFixed(3)}` : " | learning (first 2 reps)";
+  $("stats").textContent = `h ${v} | ${counter.state}${zones} | ${fps.toFixed(0)} fps${last}`;
+  drawChart(cal);
+}
+
+function drawChart(cal) {
+  const w = chart.width, h = chart.height;
+  cc.clearRect(0, 0, w, h);
+  const hist = counter.hist;
+  if (!hist || hist.length < 2) return;
+  const t1 = hist[hist.length - 1].t, t0 = t1 - 10;
+  let mn = Infinity, mx = -Infinity;
+  for (const p of hist) { if (p.v < mn) mn = p.v; if (p.v > mx) mx = p.v; }
+  if (cal) { mn = Math.min(mn, cal.B - 0.03); mx = Math.max(mx, cal.T + 0.03); }
+  if (mx - mn < 0.2) { const c = (mx + mn) / 2; mn = c - 0.1; mx = c + 0.1; }
+  const X = t => (t - t0) / 10 * w, Y = val => h - 4 - (val - mn) / (mx - mn) * (h - 8);
+  if (cal) {
+    const upZ = cal.B + 0.65 * cal.A, downZ = cal.B + counter.dFrac * cal.A;
+    cc.setLineDash([6, 4]); cc.lineWidth = 1;
+    cc.strokeStyle = "#00e676"; cc.beginPath(); cc.moveTo(0, Y(upZ)); cc.lineTo(w, Y(upZ)); cc.stroke();
+    cc.strokeStyle = "#ff5252"; cc.beginPath(); cc.moveTo(0, Y(downZ)); cc.lineTo(w, Y(downZ)); cc.stroke();
+    cc.setLineDash([]);
+  }
+  cc.strokeStyle = "#fff"; cc.lineWidth = 2; cc.beginPath();
+  hist.forEach((p, i) => { const x = X(p.t), y = Y(p.v); if (i) cc.lineTo(x, y); else cc.moveTo(x, y); });
+  cc.stroke();
 }
 
 /* ------------------------------------------------------------------ */
@@ -379,12 +434,12 @@ $("btnStart").onclick = async () => {
     $("btnStart").textContent = "شروع"; $("msg").textContent = "متوقف شد"; return;
   }
   try {
-    audioCtx = audioCtx || new AudioContext(); audioCtx.resume();   // نیاز به کلیک کاربر
+    audioCtx = audioCtx || new AudioContext(); audioCtx.resume();
     const model = $("model").value;
     if (!landmarker || loadedModel !== model) await loadLandmarker(model);
     $("msg").textContent = "در حال روشن کردن دوربین...";
     await startCamera();
-    counter.toWait("دست‌ها را صاف کن (حالت بالا)");
+    counter.toSettle("وارد حالت شنا شو و ثابت بمان");
     running = true; lockScreen();
     $("btnStart").textContent = "توقف";
     requestAnimationFrame(loop);
